@@ -23,6 +23,7 @@ MAX_TREE_ENTRIES = 400
 HOMEPAGE_URL = "https://skills.sh"
 GITHUB_API = "https://api.github.com/repos/{source}"
 GITHUB_CACHE: dict[str, dict] = {}
+REQUEST_TIMEOUT_SECONDS = 3
 
 
 @dataclass
@@ -38,6 +39,7 @@ class ProjectSummary:
     important_files: list[str]
     missing_areas: list[str]
     keywords: list[str]
+    signal_keywords: list[str]
     synopsis: str
 
 
@@ -62,6 +64,8 @@ class SkillCandidate:
     freshness: float = 0.0
     overlap_penalty: float = 0.0
     conflict_penalty: float = 0.0
+    baseline_boost: float = 0.0
+    relevance_penalty: float = 0.0
     why: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     bucket: str = ""
@@ -83,11 +87,15 @@ def _safe_json(path: Path) -> dict:
 
 
 def _tokenize(text: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9][a-z0-9-]{1,30}", text.lower())
-        if token not in STOP_WORDS
-    }
+    tokens: set[str] = set()
+    for token in re.findall(r"[a-z0-9][a-z0-9-]{1,40}", text.lower()):
+        if token not in STOP_WORDS:
+            tokens.add(token)
+        if "-" in token:
+            for part in token.split("-"):
+                if len(part) >= 2 and part not in STOP_WORDS:
+                    tokens.add(part)
+    return tokens
 
 
 def _iter_paths(root: Path) -> Iterable[Path]:
@@ -107,6 +115,7 @@ def scan_project(root: Path) -> ProjectSummary:
     package_managers: set[str] = set()
     workflows: set[str] = set()
     keywords: set[str] = set()
+    signal_keywords: set[str] = set()
 
     readme_files = sorted(root.glob("README*"))
     docs_files = sorted(
@@ -158,6 +167,7 @@ def scan_project(root: Path) -> ProjectSummary:
         workflows.update(script_to_workflows(scripts))
         frameworks.update(dep_to_frameworks(deps))
         package_managers.update(lockfile_package_managers(root))
+        signal_keywords.update(_tokenize(" ".join(deps)))
         if "typescript" in deps:
             languages.add("TypeScript")
         if "react" in deps:
@@ -171,6 +181,12 @@ def scan_project(root: Path) -> ProjectSummary:
     keywords.update(_tokenize(" ".join(frameworks)))
     keywords.update(_tokenize(" ".join(workflows)))
     keywords.update(_tokenize(" ".join(missing_areas)))
+    signal_keywords.update(_tokenize(" ".join(frameworks)))
+    signal_keywords.update(_tokenize(" ".join(workflows)))
+    signal_keywords.update(_tokenize(" ".join(package_managers)))
+    signal_keywords.update(_tokenize(" ".join(languages)))
+    signal_keywords.update(_tokenize(" ".join(important_files)))
+    signal_keywords.update(_tokenize(" ".join(missing_areas)))
     synopsis = build_synopsis(root, languages, frameworks, workflows, missing_areas)
 
     return ProjectSummary(
@@ -185,6 +201,7 @@ def scan_project(root: Path) -> ProjectSummary:
         important_files=important_files,
         missing_areas=missing_areas,
         keywords=sorted(keywords),
+        signal_keywords=sorted(signal_keywords),
         synopsis=synopsis,
     )
 
@@ -264,7 +281,13 @@ def infer_missing_areas(root: Path, workflows: set[str], important_files: list[s
         missing.append("type-checking")
     if "ci" not in workflows:
         missing.append("ci-pipeline")
-    if not any(name.startswith(".env.example") or name == ".env.example" for name in important_files):
+    if not any(
+        name == ".env.example"
+        or name.endswith("/.env.example")
+        or name == ".env.sample"
+        or name.endswith("/.env.sample")
+        for name in important_files
+    ):
         missing.append("environment-template")
     return missing
 
@@ -285,13 +308,13 @@ def build_synopsis(
     return " ".join(parts)
 
 
-def fetch_url(url: str) -> str:
+def fetch_url(url: str, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS) -> str:
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         return response.read().decode("utf-8", "ignore")
 
 
-def fetch_json(url: str) -> dict:
+def fetch_json(url: str, timeout_seconds: int = REQUEST_TIMEOUT_SECONDS) -> dict:
     request = urllib.request.Request(
         url,
         headers={
@@ -299,7 +322,7 @@ def fetch_json(url: str) -> dict:
             "Accept": "application/vnd.github+json, application/json",
         },
     )
-    with urllib.request.urlopen(request, timeout=20) as response:
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
         return json.loads(response.read().decode("utf-8", "ignore"))
 
 
@@ -375,7 +398,12 @@ def clean_html(text: str) -> str:
 
 def rank_candidates(project: ProjectSummary, candidates: list[SkillCandidate], top_n: int) -> list[SkillCandidate]:
     max_installs = max((c.installs for c in candidates), default=1)
-    project_tokens = set(project.keywords)
+    signal_tokens = set(project.signal_keywords)
+    if not signal_tokens:
+        signal_tokens = set(project.keywords)
+    framework_tokens = _tokenize(" ".join(project.frameworks + project.languages + project.package_managers))
+    workflow_tokens = _tokenize(" ".join(project.workflows))
+    profile_tokens = _tokenize(" ".join(project.frameworks + project.workflows + project.languages))
 
     for candidate in candidates:
         text = " ".join(
@@ -389,18 +417,42 @@ def rank_candidates(project: ProjectSummary, candidates: list[SkillCandidate], t
             ]
         )
         skill_tokens = _tokenize(text)
-        overlap = project_tokens & skill_tokens
-        repo_fit = min(100.0, (len(overlap) / max(4, min(len(project_tokens), 24))) * 220)
+        overlap = signal_tokens & skill_tokens
+        framework_overlap = framework_tokens & skill_tokens
+        workflow_overlap = workflow_tokens & skill_tokens
+        framework_score = 0.0
+        workflow_score = 0.0
+        token_score = 0.0
+        if framework_tokens:
+            framework_score = 70.0 * (len(framework_overlap) / len(framework_tokens))
+        if workflow_tokens:
+            workflow_score = 20.0 * (len(workflow_overlap) / len(workflow_tokens))
+        if signal_tokens:
+            token_score = 10.0 * (len(overlap) / len(signal_tokens))
+        repo_fit = min(100.0, framework_score + workflow_score + token_score)
         popularity = 100.0 * math.log(candidate.installs + 1) / math.log(max_installs + 1)
         quality = score_quality(candidate)
         freshness = score_freshness(candidate.repo_pushed_at or candidate.repo_updated_at)
+        baseline_boost = score_baseline_alignment(project, candidate, skill_tokens)
+        relevance_penalty = score_relevance_penalty(
+            project,
+            skill_tokens,
+            overlap=overlap,
+            framework_overlap=framework_overlap,
+            workflow_overlap=workflow_overlap,
+            profile_tokens=profile_tokens,
+        )
 
         candidate.repo_fit = round(repo_fit, 2)
         candidate.popularity = round(popularity, 2)
         candidate.quality = round(quality, 2)
         candidate.freshness = round(freshness, 2)
+        candidate.baseline_boost = round(baseline_boost, 2)
+        candidate.relevance_penalty = round(relevance_penalty, 2)
         candidate.score = round(
-            0.4 * repo_fit + 0.2 * quality + 0.15 * popularity + 0.1 * freshness,
+            (0.4 * repo_fit + 0.2 * quality + 0.15 * popularity + 0.1 * freshness)
+            + baseline_boost
+            - relevance_penalty,
             2,
         )
         candidate.why = build_why(project, candidate, overlap)
@@ -410,14 +462,15 @@ def rank_candidates(project: ProjectSummary, candidates: list[SkillCandidate], t
     ranked = sorted(ranked, key=lambda item: item.score, reverse=True)
 
     for candidate in ranked:
-        if candidate.score >= 55:
+        if candidate.score >= 45:
             candidate.bucket = "install-now"
-        elif candidate.score >= 38:
+        elif candidate.score >= 30:
             candidate.bucket = "optional-later"
         else:
             candidate.bucket = "discard"
 
-    selected = [candidate for candidate in ranked if candidate.bucket != "discard"][:top_n * 2]
+    selected_limit = max(top_n * 2, 40)
+    selected = ranked[:selected_limit]
     return selected
 
 
@@ -465,9 +518,61 @@ def build_why(project: ProjectSummary, candidate: SkillCandidate, overlap: set[s
         reasons.append(candidate.summary[:180])
     if candidate.installs:
         reasons.append(f"Live installs on skills.sh: {candidate.installs}")
+    if candidate.baseline_boost > 0:
+        reasons.append(f"Baseline quality boost: +{candidate.baseline_boost:.1f}")
+    if candidate.relevance_penalty > 0:
+        reasons.append(f"Relevance penalty: -{candidate.relevance_penalty:.1f}")
     if candidate.repo_pushed_at:
         reasons.append(f"Source repo recently pushed: {candidate.repo_pushed_at[:10]}")
     return reasons[:4]
+
+
+def score_baseline_alignment(project: ProjectSummary, candidate: SkillCandidate, skill_tokens: set[str]) -> float:
+    boost = 0.0
+    skill_id = candidate.skill_id.lower()
+
+    curated_match = any(
+        (
+            skill_id == marker
+            or skill_id.startswith(marker)
+            or marker in skill_id
+            or marker in candidate.source.lower()
+        )
+        for marker in WORLD_CLASS_WEB_MARKERS
+    )
+    if curated_match:
+        boost += 7.0
+
+    stack_overlap = skill_tokens & _tokenize(" ".join(project.frameworks + project.languages))
+    workflow_overlap = skill_tokens & _tokenize(" ".join(project.workflows))
+    if stack_overlap:
+        boost += min(4.0, len(stack_overlap) * 1.2)
+    if workflow_overlap:
+        boost += min(4.0, len(workflow_overlap) * 1.0)
+
+    quality_tokens = skill_tokens & WORLD_CLASS_QUALITY_TOKENS
+    if quality_tokens:
+        boost += min(3.0, len(quality_tokens) * 0.8)
+
+    return min(boost, 15.0)
+
+
+def score_relevance_penalty(
+    project: ProjectSummary,
+    skill_tokens: set[str],
+    overlap: set[str],
+    framework_overlap: set[str],
+    workflow_overlap: set[str],
+    profile_tokens: set[str],
+) -> float:
+    penalty = 0.0
+    if project.frameworks and not framework_overlap and not workflow_overlap:
+        penalty += 6.0
+    if len(overlap) <= 1:
+        penalty += 3.0
+    if (skill_tokens & OFF_DOMAIN_TOKENS) and not (skill_tokens & profile_tokens):
+        penalty += 10.0
+    return min(penalty, 18.0)
 
 
 def apply_overlap_penalties(ranked: list[SkillCandidate]) -> None:
@@ -533,8 +638,16 @@ def methodology_note() -> str:
 
 
 def render_report(project: ProjectSummary, candidates: list[SkillCandidate], top_n: int = 6) -> str:
-    install_now = [c for c in candidates if c.bucket == "install-now"][:top_n]
-    optional_later = [c for c in candidates if c.bucket == "optional-later"][:top_n]
+    install_now = apply_source_diversity(
+        [c for c in candidates if c.bucket == "install-now"],
+        limit=top_n,
+        per_source=2,
+    )
+    optional_later = apply_source_diversity(
+        [c for c in candidates if c.bucket == "optional-later"],
+        limit=top_n,
+        per_source=2,
+    )
     warnings = sorted({warning for c in candidates for warning in c.warnings})
     custom_skills = recommend_custom_skills(project)
 
@@ -584,10 +697,7 @@ def render_report(project: ProjectSummary, candidates: list[SkillCandidate], top
     lines.extend(["", "## Install Commands"])
     commands = []
     for candidate in install_now + optional_later:
-        if candidate.install_command:
-            commands.append(candidate.install_command)
-        else:
-            commands.append(f"npx skills add https://github.com/{candidate.source} --skill {candidate.skill_id}")
+        commands.append(resolve_install_command(candidate))
     for command in dict.fromkeys(commands):
         lines.append(f"- `{command}`")
 
@@ -604,21 +714,51 @@ def format_candidate(candidate: SkillCandidate) -> list[str]:
         lines.append("  Why: " + " | ".join(candidate.why[:3]))
     if candidate.warnings:
         lines.append("  Warning: " + " | ".join(candidate.warnings[:2]))
-    command = candidate.install_command or f"npx skills add https://github.com/{candidate.source} --skill {candidate.skill_id}"
+    command = resolve_install_command(candidate)
     lines.append(f"  Install: `{command}`")
     return lines
 
 
-def shortlist_candidates(project: ProjectSummary, catalog: list[SkillCandidate], limit: int = 24) -> list[SkillCandidate]:
-    project_tokens = set(project.keywords)
+def resolve_install_command(candidate: SkillCandidate) -> str:
+    command = (candidate.install_command or "").strip()
+    if command:
+        return command
+    if candidate.source.startswith("http://") or candidate.source.startswith("https://"):
+        source = candidate.source
+    else:
+        source = f"https://github.com/{candidate.source}"
+    return f"npx skills add {source} --skill {candidate.skill_id}"
+
+
+def apply_source_diversity(candidates: list[SkillCandidate], limit: int, per_source: int) -> list[SkillCandidate]:
+    selected: list[SkillCandidate] = []
+    source_count: dict[str, int] = {}
+    for candidate in candidates:
+        count = source_count.get(candidate.source, 0)
+        if count >= per_source:
+            continue
+        selected.append(candidate)
+        source_count[candidate.source] = count + 1
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def shortlist_candidates(
+    project: ProjectSummary,
+    catalog: list[SkillCandidate],
+    limit: int = 24,
+    include_nonmatching: bool = False,
+) -> list[SkillCandidate]:
+    project_tokens = set(project.signal_keywords or project.keywords)
     scored = []
     for candidate in catalog:
         text = " ".join([candidate.skill_id, candidate.name, candidate.source.replace("/", " ")])
         tokens = _tokenize(text)
         match_count = len(project_tokens & tokens)
-        if match_count == 0 and project.frameworks:
+        if match_count == 0 and project.frameworks and not include_nonmatching:
             continue
-        priority = match_count + math.log(candidate.installs + 1, 10)
+        priority = (match_count * 2) + math.log(candidate.installs + 1, 10)
         scored.append((priority, candidate))
     scored.sort(key=lambda item: item[0], reverse=True)
     return [candidate for _, candidate in scored[:limit]]
@@ -631,9 +771,16 @@ def run(project_root: Path, top_n: int) -> dict:
     if not catalog:
         raise RuntimeError("No skills could be extracted from skills.sh.")
 
-    shortlist_limit = max(12, min(24, top_n * 4))
-    shortlisted = shortlist_candidates(project, catalog, limit=shortlist_limit)
-    for candidate in shortlisted:
+    shortlist_limit = max(40, min(120, top_n * 2))
+    include_nonmatching = top_n >= 50
+    shortlisted = shortlist_candidates(
+        project,
+        catalog,
+        limit=shortlist_limit,
+        include_nonmatching=include_nonmatching,
+    )
+    enrich_limit = min(len(shortlisted), 20)
+    for candidate in shortlisted[:enrich_limit]:
         enrich_candidate(candidate)
 
     ranked = rank_candidates(project, shortlisted, top_n=top_n)
@@ -663,6 +810,32 @@ def main(argv: list[str] | None = None) -> int:
 
 
 STOP_WORDS = {
+    "a",
+    "all",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "can",
+    "do",
+    "for",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "the",
+    "their",
+    "to",
+    "which",
+    "you",
     "with",
     "from",
     "that",
@@ -683,6 +856,7 @@ STOP_WORDS = {
 }
 
 IGNORE_DIRS = {
+    ".agents",
     ".git",
     "node_modules",
     ".next",
@@ -696,6 +870,8 @@ IGNORE_DIRS = {
 }
 
 IMPORTANT_FILES = {
+    ".env.example",
+    ".env.sample",
     "package.json",
     "pnpm-lock.yaml",
     "yarn.lock",
@@ -768,6 +944,54 @@ DEP_FRAMEWORK_MAP = {
     "prisma": {"Prisma"},
     "drizzle-orm": {"Drizzle ORM"},
     "storybook": {"Storybook"},
+}
+
+WORLD_CLASS_WEB_MARKERS = {
+    "next-best-practices",
+    "vercel-react-best-practices",
+    "web-design-guidelines",
+    "vercel-composition-patterns",
+    "systematic-debugging",
+    "test-driven-development",
+    "requesting-code-review",
+    "executing-plans",
+    "writing-plans",
+    "webapp-testing",
+    "playwright",
+    "vitest",
+    "shadcn",
+    "security-best-practices",
+    "audit-website",
+}
+
+WORLD_CLASS_QUALITY_TOKENS = {
+    "testing",
+    "test",
+    "debugging",
+    "review",
+    "performance",
+    "security",
+    "accessibility",
+    "ci",
+    "type",
+    "typescript",
+    "playwright",
+    "vitest",
+    "next",
+    "react",
+    "web",
+}
+
+OFF_DOMAIN_TOKENS = {
+    "azure",
+    "entra",
+    "kusto",
+    "cosmosdb",
+    "dataverse",
+    "fabric",
+    "powerbi",
+    "lakehouse",
+    "copilot-studio",
 }
 
 

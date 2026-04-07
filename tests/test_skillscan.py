@@ -55,12 +55,23 @@ class SkillscanTests(unittest.TestCase):
                 encoding="utf-8",
             )
             (root / "tsconfig.json").write_text("{}", encoding="utf-8")
+            (root / ".env.example").write_text("FOO=bar\n", encoding="utf-8")
             summary = skillscan.scan_project(root)
             self.assertIn("Next.js", summary.frameworks)
             self.assertIn("React", summary.frameworks)
             self.assertIn("testing", summary.workflows)
             self.assertIn("linting", summary.workflows)
             self.assertIn("project-docs", summary.missing_areas)
+            self.assertNotIn("environment-template", summary.missing_areas)
+
+    def test_scan_project_ignores_agents_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".agents/skills/fake").mkdir(parents=True)
+            (root / ".agents/skills/fake/fake.py").write_text("print('x')\n", encoding="utf-8")
+            (root / "README.md").write_text("# Demo\n", encoding="utf-8")
+            summary = skillscan.scan_project(root)
+            self.assertNotIn("Python", summary.languages)
 
     def test_render_report_includes_install_command(self) -> None:
         project = skillscan.ProjectSummary(
@@ -75,6 +86,7 @@ class SkillscanTests(unittest.TestCase):
             important_files=["package.json"],
             missing_areas=["ci-pipeline"],
             keywords=["next", "testing"],
+            signal_keywords=["next", "testing"],
             synopsis="Demo project.",
         )
         candidate = skillscan.SkillCandidate(
