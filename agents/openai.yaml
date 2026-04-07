@@ -1,0 +1,4 @@
+interface:
+  display_name: "Skillscan"
+  short_description: "Scan a repo and recommend current skills."
+  default_prompt: "Use $skillscan to inspect this project, browse skills.sh, rank the best matching skills, and produce install recommendations."
